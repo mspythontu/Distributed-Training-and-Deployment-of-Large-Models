@@ -1,0 +1,47 @@
+# =============================================================
+# accelerate + DeepSpeed ZeRO Stage 3 启动配置
+# 配合 scripts/run_grpo.py 使用：accelerate launch --config_file 本文件
+#
+# 核心特性：
+#   - DeepSpeed ZeRO Stage 3（参数/梯度/优化器状态全分片，支持超大模型）
+#   - bf16 混合精度（与 Qwen2.5 训练精度一致）
+#   - offload_optimizer 卸载到 CPU，进一步节省显存（可选，显存充裕可改为 none）
+#   - gradient_clipping 1.0
+#
+# 注意事项：
+#   1. num_processes 会在启动命令中用 --num_processes $(nproc - 1) 覆盖：
+#      训练使用 GPU 数量 - 1，最后一块留给 vLLM 推理生成。
+#      例如 8 卡：accelerate launch --config_file 本文件 --num_processes 7 ...
+#   2. gradient_checkpointing（梯度检查点）不在 accelerate 的 ds 配置中，
+#      由训练侧 GRPOConfig 控制：recipes/*.yaml 中 gradient_checkpointing: true。
+#   3. QLoRA（4bit）与 ZeRO-3 参数/优化器 offload 存在兼容性限制：
+#      若加载 bnb 4bit 模型报 offload 相关错误，可关闭 offload（改为 none）
+#      或改用全参数微调模式（--mode full）。
+# =============================================================
+
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 1            # 实际进程数由 launch 命令行 --num_processes 覆盖
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_s2p: false
+use_cpu: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  gradient_accumulation_steps: auto
+  gradient_clipping: 1.0
+  offload_optimizer_device: cpu        # 优化器状态卸载到 CPU（节省显存，可改为 none）
+  offload_param_device: none
+  zero3_init_flag: true
+  zero3_save_16bit_model: true
+  zero_stage: 3
+  bf16:
+    enabled: true

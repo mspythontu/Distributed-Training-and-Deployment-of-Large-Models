@@ -1,0 +1,39 @@
+# =============================================================
+# GRPO 全参数微调配置：Qwen2.5-3B-Instruct + Countdown-Tasks
+#
+# 说明：
+# - GRPOConfig 字段直接透传给 TRL 的 GRPOConfig（见 scripts/run_grpo.py）
+# - 扩展字段（model_id 等）由脚本读取，不传给 GRPOConfig
+# - 命令行参数优先级高于本文件（如 --learning_rate 1e-6 覆盖此处）
+#
+# 启动命令（num_processes = GPU 数量 - 1，最后一块留给 vLLM 推理）：
+#   accelerate launch --config_file configs/accelerate_configs/deepspeed_zero3.yaml \
+#       --num_processes $((nproc - 1)) \
+#       scripts/run_grpo.py --config recipes/grpo-qwen-2.5-3b-countdown.yaml
+# =============================================================
+
+# ---------- 扩展字段（脚本使用） ----------
+model_id: Qwen/Qwen2.5-3B-Instruct
+
+# ---------- GRPOConfig 核心参数 ----------
+vllm: true                        # TRL 0.18+：使用 vLLM 作为生成后端
+output_dir: output/grpo-countdown
+learning_rate: 5e-7
+lr_scheduler_type: cosine
+bf16: true
+max_prompt_length: 256
+max_completion_length: 1024
+num_generations: 2
+beta: 0.001
+gradient_checkpointing: true
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+logging_steps: 10
+save_steps: 100
+max_steps: 450
+warmup_ratio: 0.1
+report_to: tensorboard
+
+# ---------- 其他（可选） ----------
+seed: 42
+log_completions: true              # 将生成的文本记录到日志/board，便于人工检查

@@ -1,0 +1,55 @@
+# =============================================================
+# DeepSpeed + TRL  GRPO 训练项目依赖
+# 建议环境：Python >= 3.10 / Linux / CUDA 12.x
+#
+# 安装顺序（重要）：
+#   1. 先按集群 CUDA 版本安装 torch（见下方注释）
+#   2. 再执行 pip install -r requirements.txt 安装其余依赖
+#   3. 最后执行 pip check 校验依赖冲突
+#
+# vLLM 与 CUDA 版本对应关系（vllm 0.8.x）：
+#   - CUDA 12.4：pip install vllm>=0.8.0（默认 wheel 即 12.4）
+#   - CUDA 12.8：需从 vllm 官方额外索引安装
+#     pip install vllm>=0.8.0 --extra-index-url https://download.pytorch.org/whl/cu128
+#   - 查看可用版本：pip index versions vllm
+# =============================================================
+
+# ---------- 核心深度学习框架 ----------
+# 建议按集群 CUDA 版本安装官方 wheel：
+#   CUDA 12.1: pip install torch>=2.5.0 --index-url https://download.pytorch.org/whl/cu121
+#   CUDA 12.4: pip install torch>=2.5.0 --index-url https://download.pytorch.org/whl/cu124
+#   CUDA 12.8: pip install torch>=2.5.0 --index-url https://download.pytorch.org/whl/cu128
+torch>=2.5.0
+torchvision>=0.20.0
+
+# ---------- HuggingFace 生态（Transformers / TRL / 数据集） ----------
+transformers>=4.56.1
+trl>=0.18.1
+datasets>=3.0.0
+tokenizers>=0.20.0
+huggingface_hub>=0.26.0
+
+# ---------- 分布式训练 ----------
+accelerate>=1.0.0
+deepspeed>=0.15.4
+numpy>=1.26.0
+
+# ---------- 参数高效微调（QLoRA） ----------
+peft>=0.17.1
+bitsandbytes>=0.45.0
+
+# ---------- 推理加速（GRPOTrainer 自动调用 vLLM 做生成） ----------
+# 注意：vllm 0.8.x 对 CUDA 版本有强依赖，请按集群 CUDA 版本选择安装源，
+# 若默认安装报 GLIBC/CUDA 相关错误，改用下方 extra-index-url 方式安装。
+vllm>=0.8.0
+
+# ---------- 分词 / 工具 ----------
+sentencepiece>=0.2.0
+einops>=0.8.0
+rich>=13.7.0
+psutil>=5.9.0
+pyyaml>=6.0.0
+
+# ---------- 日志与可视化（可选） ----------
+tensorboard>=2.17.0
+# wandb>=0.17.0   # 如需 Weights & Biases 日志，取消注释

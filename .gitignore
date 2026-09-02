@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 模型权重 / checkpoint / 输出
+output/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# 数据集与缓存
+data/*.json
+data/*.jsonl
+data/*.parquet
+data/*.arrow
+data/cache/
+data/raw/
+
+# HuggingFace 缓存
+~/.cache/huggingface/
+.cache/
+
+# DeepSpeed / Accelerate
+zero_to_fp32.py
+*.log
+logs/
+nohup.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# vLLM 临时文件
+*.tmp
