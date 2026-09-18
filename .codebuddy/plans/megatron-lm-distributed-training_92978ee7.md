@@ -45,150 +45,154 @@ todos:
       - checklist-loop6
 ---
 
-## 用户需求
-
-在现有 **DeepSpeed + TRL (GRPO)** 分布式训练项目基础上，新增 **Megatron-LM 多卡分布式训练方法**。经澄清确认，交付范围为最完整形态：
-
-1. **交付形态**：文档 + 脚本 + 环境集成——新增 Megatron 专属依赖清单、`scripts/` 与 `configs/` 下可执行脚本与参数配置，并让 `scripts/setup_env.sh` 支持一键安装 Megatron-LM 依赖（含 TransformerEngine 等编译组件）
-2. **训练场景**：覆盖**预训练/继续预训练**、**SFT 监督微调**、**GRPO 强化学习**（引入 veRL 框架的 Megatron 后端）
-3. **格式转换**：必须包含权重与数据两方面的转换能力——`Qwen/Qwen2.5-3B-Instruct` 由 HuggingFace 格式转 Megatron 检查点（双向）、`jsonl` 数据转 Megatron 二进制索引（`.bin`/`.idx`）格式，含命令与注意事项
-
 ## 产品概述
 
-在不破坏现有 TRL/DeepSpeed GRPO 链路的前提下，以**平行新增方案**的形式，为项目补齐 Megatron-LM 的 3D/5D 并行训练能力（TP 张量并行、PP 流水线并行、CP 上下文并行、DP 数据并行、EP 专家并行 + 序列并行），使同一份 Countdown-Tasks 数据与 Qwen2.5-3B 模型可分别走"TRL+DeepSpeed"与"Megatron-LM（预训练/SFT/veRL-GRPO）"两条训练路径，形成可对照、可复现的工程体系。
+为项目新增**多机 vLLM 推理服务部署**能力。当前 vLLM 仅作为 GRPOTrainer 内嵌的 rollout 引擎（训练时占用最后一张空闲卡），没有任何独立推理服务。本次补充一套 Docker 化的生产部署方案，把训练产物（或任意 HF 模型）以 OpenAI 兼容 API 的形式对外提供服务，并覆盖两种多机架构、容器编排、健康检查、客户端调用与压测。
 
 ## 核心功能
 
-- **环境一键安装**：`setup_env.sh --with-megatron`，含 torch 版本校验、编译并发控制、安装后版本验证
-- **权重双向转换**：基于 mbridge 的 HF ↔ Megatron-Core 检查点导入/导出，支持按 TP/PP/CP/VPP 分片
-- **Megatron 数据预处理**：项目 `jsonl`（prompt/target/solution）转 Megatron 所需格式，并调用官方 `preprocess_data.py` 生成 `.bin`/`.idx` 二进制索引
-- **预训练与 SFT 启动脚本**：`torchrun`/`deepspeed` 两种 launcher，3D/4D 并行参数可按卡数自动推荐组合
-- **veRL + Megatron 的 GRPO**：通过 veRL Megatron 后端实现 5D 并行强化学习，含 Megatron↔vLLM 权重重分片与 offload 选项
-- **文档体系**：README 新增完整章节（并行策略矩阵图、安装、数据、转换、三场景命令、FAQ），CHECKLIST 补充检查项与排查条目，project.md 追加 Loop 6 记录本次闭环
+- **两种多机架构，脚本模式切换**
+  - 模式 A（多实例 + 负载均衡）：每节点独立 vLLM 实例（TP 取节点内 GPU 数），Nginx 统一入口分发，并发吞吐最高，3B 模型生产首选
+  - 模式 B（Ray 集群单实例跨节点 TP/PP）：一个 vLLM 实例跨节点并行，统一入口，适用于单节点显存装不下的大模型
+- **Docker 化交付**：Dockerfile + 三套 compose（单机验证 / 多机多实例 / Ray 集群），模型目录挂载复用，避免重复下载
+- **模型来源参数化**：支持 HF repo id 或本地目录，可直接部署 SFT / GRPO 训练产物，不硬编码模型
+- **配套工具**：OpenAI 兼容客户端示例（含流式与并发）、压测脚本（吞吐 / TTFT / P99）、多节点健康检查脚本
+- **文档说明**：README 新增完整部署章节（架构对比、构建、启动、调用、压测、排障），`deploy/README.md` 作为模块说明
+
 
 ## 技术栈选型
 
-沿用项目现有栈并新增 Megatron 生态，**主链路零改动**：
+沿用项目既有栈并新增部署组件，**训练链路零改动**：
 
-| 组件 | 版本/说明 | 用途 |
-| --- | --- | --- |
-| Python | >= 3.10（Megatron 推荐 3.12） | 沿用 `setup_env.sh` 现有 `--python` |
-| PyTorch | **>= 2.6.0**（Megatron Core 硬性要求） | 与现有 `requirements.txt` 的 torch>=2.5.0 存在冲突，须显式处理 |
-| megatron-core | 最新 PyPI 稳定版 | 3D/5D 并行训练核心；`[training]` extras 含 sentencepiece/wandb/transformers |
-| TransformerEngine | 随 `[dev]` extras 编译（需 `--no-build-isolation`） | FP8/bf16 加速算子；Hopper/Ada/Blackwell 支持 FP8 |
-| mbridge | `pip install mbridge` | HF ↔ Megatron-Core 权重双向转换（veRL 官方采用） |
-| verl | PyPI/GitHub 最新 | GRPO 训练，Megatron 后端启用 5D 并行 |
-| uv | NVIDIA 官方推荐安装器 | 替代裸 pip，加速依赖解析与安装 |
+| 组件 | 版本 / 说明 | 用途 |
+|---|---|---|
+| vLLM | >= 0.8.0（与 `requirements.txt` 一致） | OpenAI 兼容推理服务，`vllm serve` 启动 |
+| Docker / Compose | Docker 20.10+、Compose v2 | 容器化编排，`deploy.resources.reservations.devices` 申请 GPU |
+| vLLM 官方镜像 | `vllm/vllm-openai`（ARG 指定版本） | 基础镜像，已含 CUDA / vLLM 依赖 |
+| Ray | 随官方镜像 | 模式 B 的多节点分布式执行后端 |
+| Nginx | 官方镜像 | 模式 A 的负载均衡网关 |
+| Python 客户端 | openai / aiohttp + requests | 客户端示例与并发压测 |
 
+## 实现方案
 
-**冲突处理决策**：Megatron 依赖放入**独立的 `requirements-megatron.txt`**，不污染主 `requirements.txt`；`--with-megatron` 安装时先校验 `torch.__version__`，低于 2.6.0 时按集群 CUDA 版本升级 torch，并在文档与 CHECKLIST 中明示该冲突。
+**核心策略**："独立模块、参数驱动、模式切换"——部署资产全部集中在 `deploy/`，与训练脚本物理隔离；模型路径、并行度、节点列表、端口等全部由 `.env` 或命令行参数驱动；`start_vllm.sh` 作为容器统一入口，按 `MODE` 变量分发到模式 A / 模式 B 的启动逻辑。
 
-## 实施方案
+**命令要点**（vLLM 0.8.x）：
 
-**核心策略**："平行新增、物理隔离、契约对齐"——Megatron 全部资产集中在 `scripts/megatron/` 与 `configs/megatron/` 下，不修改任何现有训练脚本；脚本风格严格复用项目既有约定（`set -euo pipefail` + `log_info/log_ok/log_warn/die` 彩色日志 + 头部用法/参数注释块 + LF 行尾 + `bash -n` 验证），保证风格一致、可维护。
+- 模式 A 单节点实例：`vllm serve <model> --tensor-parallel-size <节点内GPU数> --host 0.0.0.0 --port 8000 --served-model-name <name>`
+- 模式 B Ray 集群：head 节点 `ray start --head --port=6379`，worker 节点 `ray start --address=<head_ip>:6379`，
+  vLLM 侧增加 `--distributed-executor-backend ray`、`--pipeline-parallel-size`（跨节点），约束 `TP × PP = 总 GPU 数`
+- OpenAI 兼容端点：`/v1/chat/completions`、`/v1/completions`、`/v1/models`、健康检查 `/health`
 
-**三条训练链路设计**：
-
-1. **预训练/继续预训练**：`pretrain_qwen.sh` → `torchrun` + Megatron-LM `pretrain_gpt.py`，TP/PP/CP 组合 + 序列并行；Qwen2.5-3B 架构参数（36 层 / hidden 2048 / 16 heads / GQA 2 kv-groups / vocab 151936 / ffn 11008 / RMSNorm+SwiGLU / RoPE theta 1e6）
-2. **SFT**：`sft_qwen.sh` → 同一入口不同 `--train-mode finetune`（finetune + `--data-path` 指向 SFT 数据集），复用 `prepare_sft_data.py` 产出
-3. **GRPO**：`grpo_verl_megatron.sh` → `python3 -m verl.trainer.main_ppo`，`algorithm.adv_estimator=grpo`，`actor_rollout_ref.actor.strategy=megatron`，并配置 `actor_rollout_ref.actor.megatron.{tensor,pipeline,context}_model_parallel_size`、offload 开关、 `MegatronVLLMShardingManager` 驱动的 rollout TP
-
-**并行组合自动推荐**：脚本根据 `nvidia-smi` 检测到的 GPU 数给出 TP/PP/DP 组合建议（如 8 卡建议 TP2×PP2×DP2；单节点 NVLink 优先降 PP、增 DP），并校验 `world_size == TP × PP × CP × DP`，不满足立即 `die` 报错——这是新人最容易踩的错，前置校验能显著减少排查成本。
-
-## 实施注意事项
-
-- **编译控制**：安装含 TransformerEngine 的 extras 时**必须**设 `MAX_JOBS=4`（默认按 CPU 核数起任务，多核机器极易 OOM），并提示 20+ 分钟编译耗时；提供 `--megatron-lite`（`[training,lts]`）作为免编译降级路径
-- **版本冲突显式化**：主 `requirements.txt` 为 torch>=2.5.0，Megatron 需 >=2.6.0；脚本执行前用 `python -c "import torch; ..."` 校验，文档与 CHECKLIST 均记录该项
-- **转换前置依赖**：mbridge 依赖 `use_te=True`（官方注明 `use_te=False` 暂不支持），即转换前需 TransformerEngine 可用，须在步骤顺序上保证 TE 先装
-- **veRL 版本差异**：`strategy=megatron` 等参数名在不同 verl 版本存在差异，脚本参数集中于脚本头部变量区并注明"以安装版本为准"，避免用户困惑
-- **数据安全**：不改动 `data/` 现有 `train.jsonl/eval.jsonl`，Megatron 数据产物输出到独立目录 `data/megatron/`，避免污染现有训练数据
-- **兼容性边界**：不修改 `run_grpo.py`、`recipes/`、`configs/accelerate_configs/` 等既有文件，保证已推送 GitHub 的内容行为不变
-
-## 架构设计
-
-两条训练路径并存，共享数据与模型资产：
+**架构设计**
 
 ```mermaid
 flowchart TB
-    subgraph SRC["共享资产"]
-        HF["Qwen2.5-3B-Instruct<br/>(HuggingFace 格式)"]
-        JSONL["data/train.jsonl<br/>(Countdown-Tasks)"]
+    subgraph CLIENT["客户端"]
+        C1["client_example.py / benchmark.py"]
     end
-
-    subgraph MEG["新增：Megatron-LM 平行方案"]
-        CV["convert_checkpoint.py<br/>(mbridge 双向转换)"]
-        PD["prepare_sft_data.py<br/>+ preprocess_data.py<br/>生成 .bin/.idx"]
-        PT["pretrain_qwen.sh<br/>预训练 / 继续预训练"]
-        SFT["sft_qwen.sh<br/>监督微调"]
-        RL["grpo_verl_megatron.sh<br/>veRL + Megatron GRPO"]
+    LB["Nginx 负载均衡<br/>least_conn + 长超时"]
+    subgraph MODE_A["模式A：多实例 + 负载均衡"]
+        N1["node1: vLLM 实例<br/>TP = 节点内 GPU"]
+        N2["node2: vLLM 实例<br/>TP = 节点内 GPU"]
     end
-
-    subgraph OLD["既有：TRL + DeepSpeed 链路(不改动)"]
-        GRPO["launch_train.sh / run_grpo.py"]
+    subgraph MODE_B["模式B：Ray 集群单实例"]
+        RH["Ray Head 节点<br/>vllm serve + ray backend"]
+        RW1["Ray Worker GPU"]
+        RW2["Ray Worker GPU"]
     end
-
-    HF --> CV --> CV2["Megatron-Core 检查点<br/>(按 TP/PP/CP 分片)"]
-    CV2 --> PT
-    CV2 --> SFT
-    CV2 --> RL
-    JSONL --> PD --> PT
-    JSONL --> PD --> SFT
-    JSONL --> RL
-    JSONL --> GRPO
+    C1 --> LB
+    LB --> N1
+    LB --> N2
+    C1 -.-> RH
+    RH --- RW1
+    RH --- RW2
 ```
+
+## 实现注意事项
+
+- **容器 GPU 与共享内存**：必须 `--gpus all`（compose 用 `devices` 预留）+ `ipc: host` + 放大 `shm_size`，否则 PyTorch 多进程共享内存不足会在加载模型阶段失败
+- **Nginx 超时**：LLM 生成耗时长，`proxy_read_timeout` / `proxy_send_timeout` 需放大（建议 600s 以上），并关闭 `proxy_buffering` 以支持流式输出（SSE）
+- **负载均衡策略**：默认 `least_conn`；若同一会话需粘滞可切 `ip_hash`
+- **跨节点 TP 的网络要求**：模式 B 的跨节点张量并行对带宽敏感，以太网环境优先加大 `PP` 而非 `TP`；高速网络（IB/RoCE）下再考虑大 TP
+- **模型挂载**：把 HF 缓存目录与训练产物目录挂载进容器（只读），避免在每台机器重复下载；国内环境用 `HF_ENDPOINT=https://hf-mirror.com`
+- **版本一致性**：容器 vLLM 版本与 `requirements.txt` 的 `vllm>=0.8.0` 保持同一大版本，避免本地客户端与服务端行为不一致
+- **行尾与语法**：所有 `.sh` 保持 LF 行尾并通过 `bash -n`；Python 脚本通过 `py_compile`；compose / nginx 配置做 YAML 与语法校验（本机无 Docker 时至少做 YAML 解析校验）
+- **边界**：不修改 `run_grpo.py`、`recipes/`、`scripts/megatron/` 等既有文件
 
 ## 目录结构
 
 ```
 deepspeed+trl分布式/
-├── requirements-megatron.txt              # [NEW] Megatron 独立依赖清单（megatron-core[training]、TE、mbridge、verl），含 torch>=2.6.0 声明与版本冲突注释
-├── configs/megatron/                      # [NEW] Megatron 训练参数配置
-│   ├── pretrain_qwen2.5-3b.env            # [NEW] 预训练环境变量：模型架构、并行度、batch/学习率/调度、日志保存（注释说明每参数含义与调优建议）
-│   ├── sft_qwen2.5-3b.env                 # [NEW] SFT 环境变量：较小学习率、较短 epoch、loss mask 相关说明
-│   └── README.md                          # [NEW] 并行度组合速查表（按 GPU 数推荐 TP/PP/CP/DP）与取值约束
-├── scripts/megatron/                      # [NEW] Megatron 全部脚本（与主链路物理隔离）
-│   ├── convert_checkpoint.py              # [NEW] 基于 mbridge 的 HF↔Mcore 双向转换：AutoBridge.from_pretrained + get_model(weight_path) + save_weights(memory_efficient)，支持 --tp/--pp/--cp/--vpp 分片与反向导出
-│   ├── prepare_sft_data.py                # [NEW] jsonl(prompt/target/solution) → Megatron loose json → 调用官方 preprocess_data.py 产出 .bin/.idx，含 tokenizer 路径与 json-keys 参数
-│   ├── pretrain_qwen.sh                   # [NEW] 预训练启动：GPU 自动检测、并行度乘积校验、torchrun/deepspeed 双 launcher、LF 行尾、set -euo pipefail
-│   ├── sft_qwen.sh                        # [NEW] SFT 启动：--train-mode finetune、指向 SFT 数据、较小 lr 与 warmup
-│   └── grpo_verl_megatron.sh              # [NEW] veRL GRPO：strategy=megatron、5D 并行参数、offload 开关、rollout TP 与 vLLM 重分片说明
-├── scripts/setup_env.sh                   # [MODIFY] 新增 --with-megatron / --megatron-lite 参数：torch>=2.6.0 校验与升级、MAX_JOBS=4 编译控制、TE 安装、mbridge/verl 安装、验证段打印 megatron-core/TE/mbridge/verl 版本
-├── README.md                              # [MODIFY] 新增「Megatron-LM 多卡分布式训练」章节：方案对比、并行策略矩阵、环境安装、数据/权重转换、预训练/SFT/GRPO 三场景命令、多机多卡、FAQ
-├── docs/CHECKLIST.md                      # [MODIFY] 软件环境新增 Megatron 检查项（torch 版本、TE、mbridge、并行度乘积校验）、数据检查新增 bin/idx 校验、排查表新增 TE 编译 OOM/并行度不整除/权重转换失败等条目
-└── project.md                             # [MODIFY] 按第 5.2 节模板追加 Loop 6（本次 Megatron 集成闭环）
+├── deploy/                                  # [NEW] 多机 vLLM 部署模块（独立，不影响训练链路）
+│   ├── README.md                            # [NEW] 模块说明：两种架构、快速开始、参数表、排障
+│   ├── Dockerfile                           # [NEW] 基于 vllm/vllm-openai 的镜像，ARG 指定版本，内置启动入口与健康检查
+│   ├── .env.example                         # [NEW] 环境变量样例：模型路径、TP/PP、端口、节点列表、HF_ENDPOINT、GPU 显存占用
+│   ├── docker-compose.yml                   # [NEW] 单机多卡快速验证（1 个 vLLM 实例 + Nginx）
+│   ├── docker-compose.multinode.yml         # [NEW] 模式A：每节点 1 个 vLLM 实例（节点内 TP）+ Nginx 负载均衡
+│   ├── docker-compose.ray.yml               # [NEW] 模式B：Ray head/worker + 单实例跨节点 TP/PP
+│   ├── nginx/
+│   │   ├── nginx.conf.template              # [NEW] upstream 模板（含 ${VLLM_UPSTREAM} 占位、长超时、流式支持）
+│   │   └── nginx.conf                       # [NEW] 由模板 + 节点列表生成的实际配置（脚本自动生成）
+│   ├── scripts/
+│   │   ├── start_vllm.sh                    # [NEW] 容器统一入口：按 MODE 组装 vllm serve 命令（含 TP/PP/显存/最大长度等参数校验）
+│   │   ├── deploy_multinode.sh              # [NEW] 多机部署：读取节点列表，ssh 分发配置并批量拉起 compose，生成 nginx upstream
+│   │   ├── health_check.sh                  # [NEW] 健康检查：逐节点探测 /health 与 /v1/models、GPU 占用、容器状态、Nginx 入口
+│   │   ├── stop_all.sh                      # [NEW] 一键停止与清理（多机，含是否清理容器/网络的可选参数）
+│   │   └── gen_nginx_upstream.sh            # [NEW] 按节点列表渲染 nginx.conf（envsubst / sed，幂等）
+│   ├── client_example.py                    # [NEW] OpenAI 兼容客户端：单次调用、流式输出、批量并发三种示例
+│   └── benchmark.py                         # [NEW] 压测：并发数/请求数可调，统计吞吐 tok/s、TTFT、端到端 P50/P95/P99、错误率
+├── README.md                                # [MODIFY] 新增「多机 vLLM 部署」章节（架构对比、构建、两种模式启动、调用、压测、排障）
+└── project.md                               # [MODIFY] 按第 5.2 节模板追加 Loop 7（本次部署能力闭环）
 ```
 
 ## 关键代码结构
 
-转换脚本核心接口（对齐 mbridge 官方 API，需在实现时逐参数核对）：
+容器启动入口的核心命令组装（按模式分发，参数由环境变量注入）：
 
-```python
-from megatron.core import parallel_state as mpu
-from mbridge import AutoBridge
+```bash
+# 模式 A：单节点独立实例（节点内 TP）
+vllm serve "${MODEL_PATH}" \
+    --served-model-name "${SERVED_MODEL_NAME}" \
+    --tensor-parallel-size "${TP}" \
+    --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --host 0.0.0.0 --port "${VLLM_PORT}"
 
-mpu.initialize_model_parallel(
-    tensor_model_parallel_size=tp,
-    pipeline_model_parallel_size=pp,
-    virtual_pipeline_model_parallel_size=vpp,
-    context_parallel_size=cp,
-    expert_model_parallel_size=ep,
-)
-
-bridge = AutoBridge.from_pretrained(hf_model_path)
-model = bridge.get_model(weight_path=hf_model_path)      # 在线导入并按并行策略分片
-bridge.save_weights(model, save_path, memory_efficient=True)  # 导出回 HF 格式
+# 模式 B：Ray 集群单实例（TP × PP = 集群总 GPU 数）
+vllm serve "${MODEL_PATH}" \
+    --served-model-name "${SERVED_MODEL_NAME}" \
+    --tensor-parallel-size "${TP}" \
+    --pipeline-parallel-size "${PP}" \
+    --distributed-executor-backend ray \
+    --host 0.0.0.0 --port "${VLLM_PORT}"
 ```
 
-veRL Megatron GRPO 关键配置项（版本敏感，脚本头部集中声明并注明以安装版本为准）：
+Nginx upstream 模板关键片段（长超时 + 关闭缓冲以支持流式）：
 
+```nginx
+upstream vllm_backend {
+    least_conn;
+    ${VLLM_UPSTREAM}
+}
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://vllm_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;          # 支持 SSE 流式输出
+        proxy_read_timeout 600s;      # LLM 生成耗时较长
+        proxy_send_timeout 600s;
+    }
+}
 ```
-python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct \
-    actor_rollout_ref.actor.strategy=megatron \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.param_offload=True \
-    actor_rollout_ref.ref.megatron.param_offload=True \
-    actor_rollout_ref.rollout.name=vllm
-```
+
+## 验证方式
+
+- `bash -n` 校验全部 `.sh`（含容器内启动脚本）
+- `python -m py_compile` 校验 `client_example.py` / `benchmark.py`
+- YAML 解析校验 compose 文件；nginx 配置做占位符与括号配对检查
+- 全部交付文件统一为 LF 行尾（注意：本仓库 `core.autocrlf=true`，写入后需显式规范化）
+- 交叉核对：compose 内挂载路径、脚本引用的相对路径与 README 示例命令一致
+

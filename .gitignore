@@ -44,3 +44,5 @@ nohup.out
 
 # vLLM 临时文件
 *.tmp
+# 部署环境变量（可能含 API_KEY，禁止提交）
+deploy/.env

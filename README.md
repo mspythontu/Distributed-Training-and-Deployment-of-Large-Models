@@ -51,6 +51,11 @@ deepspeed+trl分布式/
 │   └── megatron/                  # Megatron 参数配置（pretrain/sft env + 并行速查）
 ├── data/                          # 数据集缓存与预处理产物（train.jsonl / eval.jsonl / megatron/）
 ├── docs/                          # 文档（CHECKLIST.md 运行检查清单）
+├── deploy/                        # 多机 vLLM 推理部署（Docker 化，两种架构）
+│   ├── Dockerfile                 # vLLM OpenAI 服务镜像（基于官方 vllm-openai）
+│   ├── docker-compose*.yml        # 单节点 / 多实例+Nginx / Ray 集群
+│   ├── nginx/                     # 负载均衡配置与模板（支持流式不缓冲）
+│   └── scripts/                   # 部署编排 / 健康检查 / 客户端 / 压测脚本
 ├── output/                        # checkpoint、日志、模型输出
 ├── requirements.txt               # 依赖清单（主链路）
 ├── requirements-megatron.txt      # Megatron 专项依赖（3D/5D 并行 + veRL）
@@ -428,6 +433,74 @@ bash scripts/megatron/pretrain_qwen.sh \
 
 - 可用 `--launcher deepspeed` 切换为 deepspeed 启动器（走其多机分发）
 - **跨机原则**：TP 限制在单节点内（NVLink 带宽高），跨机扩展优先用 PP / DP
+
+---
+
+## 多机 vLLM 推理部署（OpenAI 兼容服务）
+
+> 训练阶段的 vLLM 是 GRPOTrainer 内嵌的 rollout 引擎；本章是把它部署成
+> **独立的在线推理服务**（多机多卡、容器化），对外提供 OpenAI 兼容 API。
+> 完整说明与调优详见 [`deploy/README.md`](deploy/README.md)。
+
+### 1. 两种部署架构
+
+| 维度 | 模式 A：多实例 + 负载均衡 | 模式 B：单实例跨节点 TP/PP |
+|---|---|---|
+| 适用场景 | 单节点能装下模型（如 3B），追求**高并发吞吐** | 单节点装不下（70B+），必须**跨节点切分** |
+| 并行方式 | 每节点独立 TP（节点内），实例间无通信 | TP / PP 铺满集群所有 GPU |
+| 请求入口 | Nginx 网关统一分发 | 单入口（head 节点） |
+| 横向扩容 | 加节点即可近线性提升吞吐 | 需重算 `TP × PP` |
+| 网络要求 | 常规以太网 | 跨节点 TP 需 InfiniBand/RoCE |
+| 启动参数 | `--mode multi-instance`（默认） | `--mode ray` |
+
+> **本项目（Qwen2.5-3B）推荐模式 A**：模型单卡即可容纳，多实例可把并发吞吐做到近线性提升。
+
+### 2. 快速开始
+
+```bash
+# ① 配置：至少修改 MODEL_PATH 与 NODES（模式 B 还需 TP_SIZE/PP_SIZE）
+cp deploy/.env.example deploy/.env
+
+# ② 构建镜像（基于 vLLM 官方 vllm-openai，版本与 requirements.txt 对齐）
+docker build -t grpo-vllm:v0.8.5 --build-arg VLLM_VERSION=v0.8.5 -f deploy/Dockerfile .
+
+# ③ 一键部署（自动校验 SSH/Docker → 拉起各节点 → 生成 Nginx 配置 → 启动网关）
+bash deploy/scripts/deploy_multinode.sh --mode multi-instance   # 模式 A
+bash deploy/scripts/deploy_multinode.sh --mode ray              # 模式 B
+
+# ④ 停止与清理
+bash deploy/scripts/stop_all.sh
+```
+
+前置条件：各节点已装 Docker + nvidia-container-toolkit，且部署机可免密 SSH 登录。
+
+### 3. 验证、调用与压测
+
+```bash
+# 健康检查（服务存活 / 模型列表 / GPU / 容器 / Ray 集群资源）
+bash deploy/scripts/health_check.sh
+bash deploy/scripts/health_check.sh --verbose
+
+# OpenAI 兼容调用（含流式输出、并发示例）
+python deploy/scripts/client_example.py --base-url http://<网关IP>:8080/v1 --stream
+python deploy/scripts/client_example.py --concurrent 8
+
+# 并发压测：吞吐(tok/s)、TTFT、P50/P95/P99
+python deploy/scripts/benchmark.py --base-url http://<网关IP>:8080/v1 \
+    --concurrency 16 --requests 100 --max-tokens 256
+```
+
+客户端与压测脚本仅依赖 Python 标准库，无需安装 `openai` SDK。
+
+### 4. 关键注意事项
+
+- **共享内存**：多卡张量并行依赖共享内存传递张量，compose 中已设 `ipc: host` + `shm_size: 16g`，
+  删除会导致启动报 `bus error`
+- **流式输出**：Nginx 必须 `proxy_buffering off`（模板已配置），否则客户端收不到增量 token
+- **超时设置**：长文本生成需放大 `proxy_read_timeout`（模板已设 3600s）
+- **跨节点 TP**：以太网环境下优先加大 PP、减小跨节点 TP（all-reduce 通信量差异大）
+- **模型缓存**：挂载 `HF_HOME` 避免每个节点重复下载几十 GB 权重；
+  国内网络设 `HF_ENDPOINT=https://hf-mirror.com`
 
 ---
 

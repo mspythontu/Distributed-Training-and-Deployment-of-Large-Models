@@ -1,0 +1,26 @@
+# 统一行尾，避免 Windows 提交把 CRLF 写入仓库
+#
+# 关键：Shell 脚本必须以 LF 存储。若仓库中存的是 CRLF，
+# Linux 集群克隆后执行会报 "bad interpreter" 或莫名语法错误。
+
+# 默认：文本文件在仓库中统一为 LF，检出时也不转换为 CRLF
+* text=auto eol=lf
+
+# 显式声明脚本、配置与文档
+*.sh   text eol=lf
+*.py   text eol=lf
+*.env  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+Dockerfile text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.template text eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.safetensors binary
+*.bin binary
+*.pt binary

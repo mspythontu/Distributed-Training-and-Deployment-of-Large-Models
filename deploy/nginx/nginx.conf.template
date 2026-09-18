@@ -1,0 +1,61 @@
+# =============================================================
+# vLLM 负载均衡网关配置
+# 本文件由 deploy/scripts/gen_nginx_conf.sh 依据 .env 自动生成，请勿手动修改
+# 修改节点列表请编辑 deploy/.env 后重新运行生成脚本
+# =============================================================
+
+worker_processes auto;
+
+events {
+    # vLLM 长连接较多，适当放大连接数
+    worker_connections 4096;
+}
+
+http {
+    # 关闭访问日志可降低高并发下的 IO 压力；排查问题时可改回 main
+    access_log off;
+    error_log  /var/log/nginx/error.log warn;
+
+    sendfile on;
+    keepalive_timeout 65;
+
+    upstream vllm_backend {
+__LB_METHOD__
+__UPSTREAM_SERVERS__
+        keepalive 64;
+    }
+
+    server {
+        listen __NGINX_PORT__;
+        server_name _;
+
+        # 网关自身健康检查：任一后端存活即返回 200
+        location /health {
+            proxy_pass http://vllm_backend/health;
+            proxy_read_timeout 10s;
+        }
+
+        location / {
+            proxy_pass http://vllm_backend;
+
+            # HTTP/1.1 + 清空 Connection 头以复用 upstream keepalive
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # LLM 生成可能持续数十秒到数分钟，超时必须放大
+            proxy_connect_timeout 10s;
+            proxy_send_timeout 3600s;
+            proxy_read_timeout 3600s;
+
+            # 流式输出（SSE）必须关闭缓冲，否则客户端收不到增量 token
+            proxy_buffering off;
+            proxy_cache off;
+            chunked_transfer_encoding on;
+        }
+    }
+}

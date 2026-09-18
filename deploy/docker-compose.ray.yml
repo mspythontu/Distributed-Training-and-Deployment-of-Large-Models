@@ -1,0 +1,109 @@
+# =============================================================
+# 模式 B（单实例跨节点 TP/PP）：Ray 集群 + 单个 vLLM 实例
+#
+# 适用场景：单节点显存放不下模型（如 70B+），需把 TP/PP 铺到多机多卡
+# 与模式 A 的区别：只有一个对外服务入口，请求无需负载均衡分发
+#
+# 使用方式：
+#   # head 节点（同时承载 Ray head 与 vLLM 服务进程）
+#   docker compose -f deploy/docker-compose.ray.yml --profile head up -d
+#   # 各 worker 节点（只加入 Ray 集群，不跑服务）
+#   docker compose -f deploy/docker-compose.ray.yml --profile worker up -d
+#
+# 前置配置（deploy/.env）：
+#   RAY_HEAD_NODE=worker1        # head 节点主机名/IP，worker 靠它加入集群
+#   TP_SIZE / PP_SIZE            # 满足 TP x PP = 集群总 GPU 数
+#
+# 关键说明：
+#   - 使用 network_mode: host：Ray 需要开放大量端口（含 dashboard、object store），
+#     host 网络最省事，也避免 NAT 下的节点互通问题
+#   - --num-gpus 需如实填写：Ray 靠它统计集群 GPU 资源，填错会导致 vLLM 分配不到卡
+#   - 跨节点 TP 依赖高速网络（InfiniBand/RoCE）；仅有以太网时建议加大 PP、减小跨节点 TP
+# =============================================================
+
+services:
+  # ---------- Ray head 节点 ----------
+  ray-head:
+    profiles: ["head"]
+    image: ${RAY_IMAGE:-rayproject/ray:2.40.0-py312-cu124}
+    container_name: ray-head
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: ${SHM_SIZE:-16g}
+    command: >
+      ray start --head
+      --port=${RAY_PORT:-6379}
+      --dashboard-host=0.0.0.0
+      --dashboard-port=${RAY_DASHBOARD_PORT:-8265}
+      --num-gpus=${HEAD_GPUS:-8}
+      --block
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---------- Ray worker 节点 ----------
+  ray-worker:
+    profiles: ["worker"]
+    image: ${RAY_IMAGE:-rayproject/ray:2.40.0-py312-cu124}
+    container_name: ray-worker
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: ${SHM_SIZE:-16g}
+    command: >
+      ray start
+      --address=${RAY_HEAD_NODE}:${RAY_PORT:-6379}
+      --num-gpus=${WORKER_GPUS:-8}
+      --block
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---------- vLLM 服务（仅 head 节点，跨节点占用集群 GPU） ----------
+  vllm-ray:
+    profiles: ["head"]
+    image: ${VLLM_IMAGE:-grpo-vllm:v0.8.5}
+    container_name: vllm-ray
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    shm_size: ${SHM_SIZE:-16g}
+    depends_on:
+      - ray-head
+    environment:
+      MODEL_PATH: ${MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen2.5-3b}
+      # 模式 B：跨节点并行，由 Ray 统一调度 GPU
+      DISTRIBUTED_BACKEND: ray
+      TP_SIZE: ${TP_SIZE:-1}
+      PP_SIZE: ${PP_SIZE:-1}
+      PORT: ${PORT:-8000}
+      HOST: 0.0.0.0
+      DTYPE: ${DTYPE:-auto}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-4096}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.9}
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-256}
+      API_KEY: ${API_KEY:-}
+      EXTRA_ARGS: ${EXTRA_ARGS:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 告诉 vLLM 去哪个 Ray 集群申请资源
+      RAY_ADDRESS: ${RAY_HEAD_NODE}:${RAY_PORT:-6379}
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+      - ${MODEL_DIR:-./output}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

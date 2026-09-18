@@ -150,6 +150,20 @@ AI 工程方法正从"人工触发的一次性问答"演进为"AI 自主运行�
 - **Verify（验证）**：全部 `.sh` 通过 `bash -n` 语法检查；两个 Python 脚本通过 `py_compile`；行尾统一为 LF；引用的路径与配置键交叉核对无冲突。
 - **Feedback（反馈）**：形成与 TRL 主链路并行的第二条训练路径，三条子链路（预训练/SFT/GRPO）全部覆盖；因 veRL / Megatron 参数键随版本演进较快，脚本已在头部注明"以安装版本为准"并提供 `--dry-run` 预检；后续可在真实 GPU 集群上验证并回填实际吞吐数据。
 
+### Loop 7：多机 vLLM 推理部署（训练 →  serving 闭环）
+
+**触发 Prompt**（原文）：
+
+> "增加一下多机vllm部署的程序和README.md说明"
+
+> 澄清补充：用户确认**两种架构都支持**（多实例+负载均衡 / 单实例跨节点 TP-PP，脚本模式切换）、编排采用 **Docker 容器化**、配套需要 **客户端调用示例 + 压测脚本 + 健康检查脚本**、模型来源**参数化**（支持 HF repo id 或本地训练产物目录）。
+
+- **Observe（感知）**：项目此前只在训练链路内使用 vLLM（`recipes/*.yaml` 的 `vllm: true`，由 GRPOTrainer 内嵌做 rollout），**没有任何独立在线服务部署程序**；全库检索 `serve|deploy|docker|ray` 无 Dockerfile / compose / 编排脚本。vLLM 版本为 `>=0.8.0`，模型为 Qwen2.5-3B（单卡可容纳）。
+- **Think（规划）**：把"部署"与"训练"在物理上分离为 `deploy/` 模块，不改动任何训练脚本；架构上同时覆盖两种模式并让用户按规模选择——3B 模型推荐**模式 A（多实例+Nginx 负载均衡）**追求并发吞吐，超大模型走**模式 B（Ray 集群单实例跨节点 TP/PP）**。识别出三个易踩的工程坑并写进配置：共享内存（`ipc: host` + `shm_size`，否则 TP 报 bus error）、流式输出（Nginx 必须 `proxy_buffering off`）、长生成超时（`proxy_read_timeout`）。
+- **Act（行动）**：新增 `deploy/`（Dockerfile、3 套 compose、nginx 模板与生成脚本、`start_vllm.sh`、`deploy_multinode.sh`、`stop_all.sh`、`health_check.sh`、`client_example.py`、`benchmark.py`、`deploy/README.md`）；主 `README.md` 新增「多机 vLLM 推理部署」章节并在项目结构中登记 `deploy/`。客户端与压测脚本刻意只用标准库 `urllib`，保证零额外依赖开箱即用。
+- **Verify（验证）**：Shell 脚本 `bash -n` 通过、Python 脚本 `py_compile` 通过、3 个 compose YAML 可被解析、行尾统一为 LF。
+- **Feedback（反馈）**：补齐"训练 → 部署 → 压测"的完整闭环，模型路径参数化使 SFT/GRPO 产物可直接上线（与 Loop 4、Loop 6 产物衔接）；后续可在真实多机环境跑 `benchmark.py` 回填两种模式的吞吐对比数据。
+
 ---
 
 ## 4. 闭环演进图谱
