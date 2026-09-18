@@ -29,6 +29,9 @@ print('CUDA 可用     :', torch.cuda.is_available(), torch.version.cuda)
 
 # ③ 10 条样本冒烟验证（5 步，分钟级，QLoRA 默认）
 bash scripts/quick_test.sh
+
+# ④ Megatron-LM 链路自检（可选，仅安装 --with-megatron 后需要）
+bash scripts/megatron/pretrain_qwen.sh --dry-run     # 并行度预检 + 打印完整命令
 ```
 
 若 ①②③ 全部通过，基本可进入正式训练：
@@ -169,6 +172,24 @@ echo $WANDB_MODE                                             # 离线模式：�
 > **预期结果**：wandb 已安装、API Key 有效，`wandb.login()` 免交互通过。
 > **说明**：本项目通过 `--report_to wandb` 启用 wandb 记录，完整说明见第 5 章。
 
+### 2.8 Megatron-LM 环境（可选）
+
+> 未加 `--with-megatron` 安装时可跳过本节；启用 Megatron 三条链路（预训练/SFT/GRPO）前逐项检查：
+
+```bash
+python -c "import torch; print('torch', torch.__version__)"                           # 预期 >= 2.6.0（Megatron 硬性要求）
+python -c "import megatron.core; print('megatron.core', megatron.core.__version__)"   # Mcore 可用
+python -c "import transformer_engine; print('TE', transformer_engine.__version__)"    # TE（mbridge 硬依赖）
+python -c "import mbridge; print('mbridge OK')"                                       # HF↔Mcore 权重转换
+python -c "import verl; print('verl', verl.__version__)"                              # GRPO 框架
+echo $MEGATRON_PATH                                                                   # Megatron-LM 源码根目录
+ls ${MEGATRON_PATH}/pretrain_gpt.py ${MEGATRON_PATH}/tools/preprocess_data.py         # 关键脚本存在
+```
+
+> **预期结果**：5 个库均可导入、torch >= 2.6.0，且 `pretrain_gpt.py` 与 `tools/preprocess_data.py` 存在。
+> **常见坑**：① torch 低于 2.6.0 会导致 Megatron 导入失败（主链路只需 2.5.0）；
+> ② TE 缺失会让 mbridge 转换报错（官方注明 `use_te=False` 暂不支持）。
+
 ---
 
 ## 3. 数据检查
@@ -226,6 +247,20 @@ python scripts/reward_functions.py
 
 > **预期结果**：输出 `ALL TESTS PASSED`。
 > 若 reward 异常（训练中全 0/恒值），优先排查此项与数据格式。
+
+### 3.5 Megatron bin/idx 分词产物校验
+
+```bash
+# 确认分词产物已生成（形如 <prefix>_<key>_document.bin / .idx，必须成对出现）
+ls -lh data/megatron/ | grep -E "\.bin$|\.idx$"
+du -sh data/megatron/
+```
+
+> **预期结果**：`.bin` 与 `.idx` 成对存在，文件大小与样本量成正比（几百条数据约数 MB）。
+> 若缺失，重新生成（注意 `--megatron-path` 指向含 `tools/preprocess_data.py` 的仓库根）：
+> `python scripts/megatron/prepare_sft_data.py --mode sft --megatron-path /path/to/Megatron-LM`
+>
+> 训练时必须用**不带后缀**的前缀：`--data-path data/megatron/countdown_sft`。
 
 ---
 
@@ -288,6 +323,17 @@ bash scripts/launch_train.sh --mode full    # 或 --mode qlora
 
 > **预期**：脚本打印 GPU 数、`num_processes = GPU 数 - 1`、完整 accelerate 命令，
 > 随后进入训练；`nvidia-smi` 可见训练进程 + vLLM 进程。
+
+### 4.6 Megatron 并行度预检（改用 Megatron 链路时）
+
+```bash
+bash scripts/megatron/pretrain_qwen.sh --dry-run     # 只做校验并打印命令，不真正启动
+```
+
+> **预期结果**：输出 `并行校验通过：TP=... PP=... CP=... EP=... -> DP=...` 并打印完整 torchrun 命令。
+> 此步会提前拦截以下错误：**world_size 不能被 TP×PP×CP 整除**、层数不能被 PP 整除、
+> 注意力头数/GQA 分组数不能被 TP 整除、**batch 与 DP×运行数不匹配**。
+> 在此报错说明配置非法，**不要**直接提交到集群排队。
 
 ---
 
@@ -385,6 +431,12 @@ bash scripts/launch_train.sh --report_to wandb
 | **数据行数过少报错** | 数据集不足 / GRPO batch 组合不满 | GRPO 每步需 `per_device_train_batch_size × num_generations` 条样本；小数据验证用 `bash scripts/quick_test.sh` |
 | **下载模型/数据集超时** | 网络问题 | `export HF_ENDPOINT=https://hf-mirror.com`；或提前 `huggingface-cli download Qwen/Qwen2.5-3B-Instruct` 预下载 |
 | **wandb 连接超时 / 登录失败** | 网络无法直连 / API Key 无效 | ① `wandb login --relogin` 重新授权；② 确认 `WANDB_API_KEY` 正确；③ `export WANDB_MODE=offline` 离线训练后 `wandb sync`；④ 退回 `--report_to tensorboard` |
+| **TransformerEngine 编译 OOM / 长时间卡死** | 并行编译任务过多 | ① `MAX_JOBS=4` 限制并发（`--max-jobs 4`）；② 用 `--megatron-lite` 跳过 TE 编译；③ 内存不足时改用 NGC PyTorch 容器（依赖预编译） |
+| **`import megatron.core` 失败 / 报 torch 版本** | torch 低于 2.6.0（主链路只需 2.5.0） | `python -c "import torch; print(torch.__version__)"`；按集群 CUDA 升级：`pip install "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu124` |
+| **并行度报错：乘积不整除 / TP 非法** | TP×PP×CP 组合不匹配，或 TP 超过 GQA 分组数 | ① 确认 `world_size == TP×PP×CP×DP`；② Qwen2.5-3B 的 GQA=2，**TP 最大为 2**；③ 改扩 PP / DP；详见 `configs/megatron/README.md` |
+| **mbridge 转换失败 / use_te 相关报错** | 未安装 TransformerEngine | `python -c "import transformer_engine"`；缺失则重装含 `[dev]` extras 的 megatron-core（mbridge 官方注明 `use_te=False` 暂不支持） |
+| **Megatron 报数据路径不存在** | bin/idx 未生成，或 `--data-path` 写错 | ① `ls data/megatron/<prefix>*.bin`；② `--data-path` 填**不带后缀**的前缀；③ 重跑 `prepare_sft_data.py --megatron-path <repo>` |
+| **veRL 报 `Could not resolve config xxx`** | veRL 版本与脚本使用的配置键不一致 | 对照安装版本的 `verl/trainer/config/ppo_trainer.yaml`，调整 `grpo_verl_megatron.sh` 中的配置键（veRL 迭代快，键名随版本变化） |
 
 ---
 

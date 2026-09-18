@@ -136,6 +136,20 @@ AI 工程方法正从"人工触发的一次性问答"演进为"AI 自主运行�
 - **Verify（验证）**：逐一核对文档引用的文件路径真实存在；Markdown 结构完整性检查（标题层级、5 个 Loop 单元六字段齐全、代码块/mermaid 块闭合、表格格式正确）；5 条提示词覆盖与相对历史清单逐一比对无遗漏。
 - **Feedback（反馈）**：本循环自身构成一个**元循环**（"关于循环的循环"）——它把此前 4 个循环的沉淀固化为文档资产，使整个项目的演进过程可复盘、可复用；后续新提示词按 `## 5` 的登记模板继续进入循环。
 
+### Loop 6：Megatron-LM 链路集成（平行方案扩展）
+
+**触发 Prompt**（原文）：
+
+> "加上megatron-lm的多卡分布式训练方法"
+
+> 澄清补充：用户随后确认交付范围为「**文档 + 脚本 + 环境集成**」、场景覆盖「**预训练 + SFT + GRPO（增加 veRL）**」、且**需要**「模型权重与数据格式的双向转换说明」。
+
+- **Observe（感知）**：项目已有成熟的 TRL + DeepSpeed(ZeRO-3) GRPO 链路；全库检索 `megatron` / `tensor-model-parallel` 等关键词 **0 处匹配**，需从零新增；联网核实 Megatron Core 官方安装方式（PyPI / extras / 源码 / NGC 容器）、mbridge 双向转换 API、veRL Megatron 后端的 5D 并行与 offload 参数。识别出关键**版本冲突**：Megatron Core 要求 `torch>=2.6.0`，而主 `requirements.txt` 为 `torch>=2.5.0`。
+- **Think（规划）**：采用"**平行新增、物理隔离、契约对齐**"策略——Megatron 全部资产集中在 `scripts/megatron/` 与 `configs/megatron/`，依赖独立为 `requirements-megatron.txt`，**不改动任何既有训练脚本**；脚本风格复用项目既有约定（`set -euo pipefail` + 彩色日志 + 头部注释块 + LF 行尾 + `bash -n` 验证）。针对 Qwen2.5-3B 的 `num_query_groups=2`，识别出 **TP 上限为 2**，并写成脚本前置校验项，避免用户排进集群后才发现配置非法。
+- **Act（行动）**：新增 `requirements-megatron.txt`、`scripts/megatron/{convert_checkpoint.py, prepare_sft_data.py, pretrain_qwen.sh, sft_qwen.sh, grpo_verl_megatron.sh}`、`configs/megatron/{pretrain_qwen2.5-3b.env, sft_qwen2.5-3b.env, README.md}`；`setup_env.sh` 新增 `--with-megatron` / `--megatron-lite` / `--max-jobs` 及验证段打印；`README.md` 新增完整章节；`docs/CHECKLIST.md` 补充检查项与排查条目。
+- **Verify（验证）**：全部 `.sh` 通过 `bash -n` 语法检查；两个 Python 脚本通过 `py_compile`；行尾统一为 LF；引用的路径与配置键交叉核对无冲突。
+- **Feedback（反馈）**：形成与 TRL 主链路并行的第二条训练路径，三条子链路（预训练/SFT/GRPO）全部覆盖；因 veRL / Megatron 参数键随版本演进较快，脚本已在头部注明"以安装版本为准"并提供 `--dry-run` 预检；后续可在真实 GPU 集群上验证并回填实际吞吐数据。
+
 ---
 
 ## 4. 闭环演进图谱

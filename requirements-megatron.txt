@@ -1,0 +1,49 @@
+# ===================== Megatron-LM 专项依赖（预训练 / SFT / GRPO） =====================
+#
+# 用途：为项目提供 Megatron Core 的 3D/5D 并行训练能力（TP/PP/CP/DP/EP + 序列并行），
+#       覆盖预训练、继续预训练、SFT 监督微调，以及基于 veRL Megatron 后端的 GRPO 强化学习。
+#
+# 注意 torch 版本冲突（重要）
+#   主 requirements.txt    ：torch>=2.5.0（TRL + DeepSpeed 的 GRPO 链路）
+#   Megatron Core 官方要求 ：torch>=2.6.0
+#   处理方式：torch 由 scripts/setup_env.sh 在 --with-megatron 时统一校验 / 升级，
+#             本文件不再重复声明 torch，避免覆盖「按集群 CUDA 版本安装的 wheel」。
+#   手动升级示例（CUDA 12.4）：
+#     pip install "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu124
+#
+# 推荐安装方式（由 setup_env.sh --with-megatron 自动执行）：
+#   ① pip install uv                                              # NVIDIA 官方推荐安装器
+#   ② MAX_JOBS=4 uv pip install --system --no-build-isolation "megatron-core[training,dev]"
+#       └ 含 TransformerEngine，需就地编译（20+ 分钟）；MAX_JOBS 用于限制并发防止 OOM
+#   ③ pip install -r requirements-megatron.txt
+#
+# 免编译降级：把 ② 的 extras 换成 [training,lts]（不含 TransformerEngine / ModelOpt）
+# ==========================================================================================
+
+# ---------- 安装器 ----------
+# uv 的依赖解析速度显著快于 pip，NVIDIA 官方文档推荐；缺失时 setup_env.sh 会自动回退 pip
+uv>=0.5.0
+
+# ---------- 核心（不在此处安装） ----------
+# megatron-core 本体由 setup_env.sh 以 extras 方式安装（[training,dev] 或 [training,lts]），
+# 此处不重复声明，避免与 --no-build-isolation 的编译流程冲突。
+# extras 含义：
+#   [training] : wandb / sentencepiece / transformers（预训练与 SFT 所需）
+#   [dev]      : 额外含 TransformerEngine / ModelOpt（需编译，支持 FP8 / 融合算子）
+#   [lts]      : 轻量版 dev，不含 TE 与 ModelOpt（与 [dev] 互斥）
+
+# ---------- HF <-> Megatron-Core 权重双向转换 ----------
+# AutoBridge.from_pretrained(hf_path) -> get_model(weight_path) 在线按并行策略分片导入
+# save_weights(model, path, memory_efficient=True) 导出回 HF 格式供推理引擎使用
+# 支持架构：Qwen2 / Qwen2.5-VL / Qwen3 / Qwen3-MoE / LLaMA / DeepseekV3 / Mixtral / Mimo
+# 注意：mbridge 依赖 TransformerEngine（官方注明 use_te=False 暂不支持），需先装 TE
+mbridge
+
+# ---------- 强化学习（GRPO / PPO） ----------
+# veRL 的 Megatron 后端支持 5D 并行（TP/EP/CP/DP/PP）+ 序列并行，
+# 并通过 3D HybridEngine 在 actor 与 rollout(vLLM/SGLang) 间做权重重分片
+verl
+
+# ---------- 通用 ----------
+numpy>=1.26.0
+packaging>=23.0          # setup_env.sh 用它做 torch 版本比较（Version）

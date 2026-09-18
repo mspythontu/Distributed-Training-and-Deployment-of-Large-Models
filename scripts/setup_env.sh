@@ -16,6 +16,8 @@
 #   bash scripts/setup_env.sh --env-name grpo --python 3.10
 #   bash scripts/setup_env.sh --skip-verify                # 跳过末尾版本验证
 #   bash scripts/setup_env.sh --with-wandb                 # 额外安装 wandb（训练可视化）
+#   bash scripts/setup_env.sh --with-megatron              # 额外安装 Megatron-LM 生态（含 TE 编译）
+#   bash scripts/setup_env.sh --megatron-lite              # 轻量安装 Megatron（跳过 TE 编译）
 #
 # 参数说明：
 #   --env-name NAME         conda 环境名（默认 grpo）
@@ -23,6 +25,10 @@
 #   --cuda CUXXX            cu121 / cu124 / cu128；缺省根据 nvidia-smi 自动推断
 #   --source-trl            从源码安装 trl（支持 Liger GRPO Loss）
 #   --with-wandb            安装 wandb（训练可视化，配合 --report_to wandb 使用，默认不装）
+#   --with-megatron         安装 Megatron-LM 生态（megatron-core + TransformerEngine +
+#                           mbridge 权重转换 + veRL），需 torch>=2.6.0
+#   --megatron-lite         同 --with-megatron，但跳过 TransformerEngine 编译（改用 [training,lts]）
+#   --max-jobs N            编译并发度（默认 4，防止多核机器编译 TE 时 OOM）
 #   --hf-endpoint URL       HuggingFace 镜像地址（默认 https://hf-mirror.com）
 #   --force                 环境已存在时删除重建（默认遇到已存在环境直接退出）
 #   --skip-verify           跳过安装后的版本验证
@@ -32,6 +38,10 @@
 #   - 脚本面向 Linux GPU 集群（bash + conda + nvidia-smi）
 #   - torch 安装顺序遵循 requirements.txt 头部说明：先按 CUDA 版本装 torch，再装其余依赖
 #   - CUDA 12.8 时 vLLM 需要额外索引重装（vllm 0.8.x 对 CUDA 版本强依赖）
+#   - torch 版本冲突：主链路（TRL+DeepSpeed）要求 torch>=2.5.0，Megatron Core 要求 >=2.6.0；
+#     指定 --with-megatron 时会自动校验，低于要求则按当前 CUDA 索引升级 torch
+#   - TransformerEngine 为就地编译安装，耗时 20+ 分钟且内存峰值高，用 --max-jobs 限制并发；
+#     资源受限或无需 FP8 时请用 --megatron-lite 跳过编译
 # =============================================================
 set -euo pipefail
 
@@ -46,10 +56,15 @@ WITH_WANDB="no"         # yes/no：是否额外安装 wandb（训练可视化）
 HF_ENDPOINT="https://hf-mirror.com"
 FORCE="no"
 SKIP_VERIFY="no"
+WITH_MEGATRON="no"      # yes/no：是否安装 Megatron-LM 生态（预训练/SFT/GRPO）
+MEGATRON_LITE="no"      # yes/no：跳过 TransformerEngine 编译（改用 [training,lts]）
+MAX_JOBS=4              # 编译并发度限制（防止多核机器编译 TE 时 OOM）
+TORCH_MIN_MEGATRON="2.6.0"   # Megatron Core 官方硬性要求的最低 torch 版本
 
 # 项目根目录 = 脚本所在目录的上一级
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REQ_FILE="${PROJECT_DIR}/requirements.txt"
+REQ_MEGATRON="${PROJECT_DIR}/requirements-megatron.txt"
 
 # ---------------------------------------------------------------------------
 # 工具函数：彩色进度提示 + 错误退出
@@ -62,7 +77,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()       { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' | sed 's/^#//'
+    sed -n '2,/^# =\{10,\}/p' "$0" | sed 's/^# \{0,1\}//' | sed 's/^#//'
     exit 0
 }
 
@@ -76,6 +91,9 @@ while [[ $# -gt 0 ]]; do
         --cuda)          CUDA_FLAG="$2"; shift 2 ;;
         --source-trl)    SOURCE_TRL="yes"; shift ;;
         --with-wandb)    WITH_WANDB="yes"; shift ;;
+        --with-megatron)  WITH_MEGATRON="yes"; shift ;;
+        --megatron-lite)  MEGATRON_LITE="yes"; shift ;;
+        --max-jobs)       MAX_JOBS="$2"; shift 2 ;;
         --hf-endpoint)   HF_ENDPOINT="$2"; shift 2 ;;
         --force)         FORCE="yes"; shift ;;
         --skip-verify)   SKIP_VERIFY="yes"; shift ;;
@@ -89,6 +107,9 @@ done
 # ---------------------------------------------------------------------------
 log_info "项目目录: ${PROJECT_DIR}"
 [[ -f "$REQ_FILE" ]] || die "未找到 requirements.txt: ${REQ_FILE}"
+if [[ "$WITH_MEGATRON" == "yes" || "$MEGATRON_LITE" == "yes" ]]; then
+    [[ -f "$REQ_MEGATRON" ]] || die "未找到 Megatron 依赖清单: ${REQ_MEGATRON}"
+fi
 command -v conda >/dev/null 2>&1 || die "未找到 conda 命令。请先安装 Miniconda/Anaconda 并加入 PATH（参见 https://docs.conda.io/en/latest/miniconda.html）"
 command -v git  >/dev/null 2>&1 || die "未找到 git 命令。请先安装 git（源码安装 trl 需要）"
 
@@ -184,6 +205,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 可选：安装 Megatron-LM 生态（预训练 / SFT / GRPO 三条链路）
+# ---------------------------------------------------------------------------
+if [[ "$WITH_MEGATRON" == "yes" || "$MEGATRON_LITE" == "yes" ]]; then
+    # extras 选择：lite 模式用 [training,lts] 跳过 TransformerEngine 编译
+    if [[ "$MEGATRON_LITE" == "yes" ]]; then
+        MEGATRON_EXTRAS="training,lts"
+        log_info "安装 Megatron-LM 生态（轻量模式，跳过 TransformerEngine 编译）..."
+    else
+        MEGATRON_EXTRAS="training,dev"
+        log_info "安装 Megatron-LM 生态（完整模式，含 TransformerEngine 编译）..."
+    fi
+
+    # 安装器：优先 uv（NVIDIA 官方推荐），缺失时回退 pip
+    pip install -q "uv>=0.5.0" 2>/dev/null || log_warn "uv 安装失败，回退使用 pip（依赖解析较慢）"
+    megatron_install() {
+        if command -v uv >/dev/null 2>&1; then
+            uv pip install --system "$@"
+        else
+            pip install "$@"
+        fi
+    }
+
+    # ① torch 版本校验：Megatron Core 硬性要求 >= 2.6.0（主链路仅需 2.5.0）
+    if python -c "
+import sys, torch
+from packaging.version import Version
+sys.exit(0 if Version(torch.__version__.split('+')[0]) >= Version('${TORCH_MIN_MEGATRON}') else 1)
+"; then
+        log_ok "torch 版本满足 Megatron 要求（>= ${TORCH_MIN_MEGATRON}）"
+    else
+        log_warn "当前 torch 低于 Megatron 要求的 ${TORCH_MIN_MEGATRON}，按索引 ${CUDA_FLAG} 升级 ..."
+        megatron_install "torch>=${TORCH_MIN_MEGATRON}" "torchvision>=0.21.0" \
+            --index-url "https://download.pytorch.org/whl/${CUDA_FLAG}"
+        log_ok "torch 已升级至 >= ${TORCH_MIN_MEGATRON}"
+    fi
+
+    # ② 安装 megatron-core（[dev] extras 会就地编译 TransformerEngine）
+    if [[ "$MEGATRON_LITE" == "no" ]]; then
+        log_warn "即将编译 TransformerEngine（MAX_JOBS=${MAX_JOBS}，约 20+ 分钟，请勿中断）..."
+    fi
+    export MAX_JOBS
+    megatron_install --no-build-isolation "megatron-core[${MEGATRON_EXTRAS}]"
+    log_ok "megatron-core[${MEGATRON_EXTRAS}] 安装完成"
+
+    # ③ 安装权重转换工具与 RL 框架（mbridge / veRL）
+    log_info "安装 mbridge（HF↔Mcore 权重转换）与 veRL（GRPO 强化学习）..."
+    pip install -r "$REQ_MEGATRON"
+    log_ok "Megatron-LM 生态安装完成"
+else
+    log_info "跳过 Megatron-LM 安装（如需 Megatron 多卡训练请加 --with-megatron）"
+fi
+
+# ---------------------------------------------------------------------------
 # 配置 HuggingFace 镜像源（国内加速，幂等追加到 ~/.bashrc）
 # ---------------------------------------------------------------------------
 log_info "配置 HuggingFace 镜像源: ${HF_ENDPOINT}"
@@ -242,6 +316,18 @@ PY
 if [[ "$WITH_WANDB" == "yes" ]]; then
     python -c "import wandb; print(f'  wandb           : {wandb.__version__}')"
 fi
+if [[ "$WITH_MEGATRON" == "yes" || "$MEGATRON_LITE" == "yes" ]]; then
+python - <<'PY'
+for label, name in (("megatron.core", "megatron.core"), ("transformer_engine", "transformer_engine"),
+                    ("mbridge", "mbridge"), ("verl", "verl")):
+    try:
+        mod = __import__(name, fromlist=["*"])
+        ver = getattr(mod, "__version__", None)
+        print(f"  {label:<20}: {ver if ver else '已安装'}")
+    except Exception as e:
+        print(f"  {label:<20}: 导入失败 -> {e}")
+PY
+fi
 
 echo "------------------------------------------------------------"
 deepspeed --version || echo "  deepspeed --version 执行失败"
@@ -254,4 +340,13 @@ echo "    bash scripts/launch_train.sh   # 启动正式训练"
 echo "    bash scripts/quick_test.sh     # 快速冒烟验证"
 if [[ "$WITH_WANDB" == "yes" ]]; then
     echo "    bash scripts/launch_train.sh --report_to wandb   # 使用 wandb 记录训练"
+fi
+if [[ "$WITH_MEGATRON" == "yes" || "$MEGATRON_LITE" == "yes" ]]; then
+    echo ""
+    echo "  Megatron-LM 链路："
+    echo "    python scripts/megatron/convert_checkpoint.py --help      # HF↔Mcore 权重转换"
+    echo "    python scripts/megatron/prepare_sft_data.py --help        # jsonl→Megatron bin/idx"
+    echo "    bash scripts/megatron/pretrain_qwen.sh                    # 预训练 / 继续预训练"
+    echo "    bash scripts/megatron/sft_qwen.sh                         # SFT 监督微调"
+    echo "    bash scripts/megatron/grpo_verl_megatron.sh               # GRPO 强化学习"
 fi

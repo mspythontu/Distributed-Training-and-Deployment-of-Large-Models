@@ -32,13 +32,29 @@ deepspeed+trl分布式/
 ├── scripts/                       # 训练/工具脚本
 │   ├── prepare_countdown_data.py  # 数据预处理（生成 train.jsonl / eval.jsonl）
 │   ├── reward_functions.py        # GRPO 奖励函数（correctness / format / combined）
-│   └── run_grpo.py                # GRPO 训练主脚本
+│   ├── run_grpo.py                # GRPO 训练主脚本（TRL + DeepSpeed 主链路）
+│   ├── launch_train.sh            # 一键启动训练（GPU 自动检测，预留 vLLM 卡）
+│   ├── quick_test.sh              # 快速冒烟验证（10 条样本 × 5 步）
+│   ├── setup_env.sh               # 一键环境安装（可选 --with-megatron / --with-wandb）
+│   └── megatron/                  # Megatron-LM 平行方案（预训练 / SFT / GRPO）
+│       ├── convert_checkpoint.py  # HF↔Megatron-Core 权重双向转换（mbridge）
+│       ├── prepare_sft_data.py    # jsonl → Megatron bin/idx 分词索引
+│       ├── pretrain_qwen.sh       # 预训练 / 继续预训练
+│       ├── sft_qwen.sh            # SFT 监督微调
+│       └── grpo_verl_megatron.sh  # GRPO（veRL + Megatron 后端）
 ├── recipes/                       # 训练参数配方（yaml）
 │   ├── grpo-qwen-2.5-3b-countdown.yaml       # 全参数微调
 │   └── grpo-qwen-2.5-3b-countdown-qlora.yaml # QLoRA（4bit + LoRA）
-├── data/                          # 数据集缓存与预处理产物（train.jsonl / eval.jsonl）
+├── configs/                       # 训练配置文件
+│   ├── accelerate_configs/        # accelerate launch 启动配置
+│   ├── deepspeed/                 # DeepSpeed 原始配置（可选）
+│   └── megatron/                  # Megatron 参数配置（pretrain/sft env + 并行速查）
+├── data/                          # 数据集缓存与预处理产物（train.jsonl / eval.jsonl / megatron/）
+├── docs/                          # 文档（CHECKLIST.md 运行检查清单）
 ├── output/                        # checkpoint、日志、模型输出
-├── requirements.txt               # 依赖清单（锁定最低版本）
+├── requirements.txt               # 依赖清单（主链路）
+├── requirements-megatron.txt      # Megatron 专项依赖（3D/5D 并行 + veRL）
+├── project.md                     # 工程循环档案（Loop Engineering）
 └── README.md
 ```
 
@@ -250,6 +266,170 @@ accelerate launch --config_file accelerate_config.yaml --num_machines 2 --machin
     --main_process_ip <worker1_ip> --main_process_port 29500 --num_processes 7 \
     scripts/run_grpo.py --config recipes/grpo-qwen-2.5-3b-countdown.yaml
 ```
+
+## Megatron-LM 多卡分布式训练（预训练 / SFT / GRPO）
+
+> 项目主链路是 **TRL + DeepSpeed(ZeRO-3)**；本章提供 **Megatron-LM 平行方案**，
+> 用 3D/5D 并行（TP / PP / CP / EP / DP + 序列并行）覆盖预训练、SFT 与 GRPO 三条链路。
+> 两套方案共享同一份 Countdown-Tasks 数据与 Qwen2.5-3B 模型，便于对照实验。
+
+### 0. 方案怎么选
+
+| 维度 | TRL + DeepSpeed（主链路） | Megatron-LM（本章） |
+|---|---|---|
+| 并行方式 | ZeRO-3 参数分片 + 数据并行 | TP / PP / CP / EP / DP + 序列并行（5D） |
+| 上手成本 | 低（HF 生态，配置即用） | 中高（需转换权重与数据格式） |
+| 适用场景 | 单机 / 小规模多机，快速实验 | 大规模集群、超长序列、追求极致吞吐 |
+| RL rollout | GRPOTrainer 内建 vLLM | veRL 3D HybridEngine（actor↔rollout 权重重分片） |
+| 性能特征 | 简单稳定 | 依靠 TransformerEngine 融合算子获得更高 MFU |
+
+### 1. 环境安装
+
+```bash
+# 在原有环境上追加 Megatron 生态（megatron-core + TransformerEngine + mbridge + veRL）
+bash scripts/setup_env.sh --with-megatron
+
+# 资源受限 / 不需要 FP8：跳过 TransformerEngine 编译
+bash scripts/setup_env.sh --megatron-lite
+```
+
+安装要点：
+
+- **torch 版本冲突**：Megatron Core 要求 `torch>=2.6.0`，而主链路仅需 `>=2.5.0`；
+  脚本会先校验，不满足时按集群 CUDA 索引自动升级
+- **编译耗时**：`megatron-core[training,dev]` 会就地编译 TransformerEngine，约 **20+ 分钟**；
+  默认 `MAX_JOBS=4` 限制并发防止多核机器 OOM，可用 `--max-jobs N` 调整
+- **推荐路径**：生产环境优先使用 [NVIDIA NGC PyTorch 容器](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)（依赖预编译）
+- 安装完成后验证段会打印 `megatron.core` / `transformer_engine` / `mbridge` / `verl` 的版本
+
+### 2. 并行策略速查表
+
+3D/5D 并行必须满足 `world_size == TP × PP × CP × DP`：
+
+| GPU 数 | TP | PP | CP | DP | 说明 |
+|---|---|---|---|---|---|
+| 1 | 1 | 1 | 1 | 1 | 调试跑通 |
+| 4 | 2 | 1 | 1 | 2 | 单节点，TP 覆盖 NVLink |
+| 8 | 2 | 1 | 1 | 4 | 单节点 8 卡最常用 |
+| 16 | 2 | 2 | 1 | 4 | 两节点，PP 跨机分摊显存 |
+| 32 | 2 | 4 | 1 | 4 | 大规模扩展 |
+
+> ⚠ **Qwen2.5-3B 特别注意**：模型使用 GQA（`num_heads=16`、`num_query_groups=2`），
+> 两个值都必须能被 TP 整除，因此 **TP 最大只能取 2**。
+> 需要更大并行度请用 PP / DP 扩展。详见 `configs/megatron/README.md`。
+
+脚本会自动按卡数推荐组合，并在启动前做全套约束校验（不满足直接报错，避免排进集群才失败）。
+
+### 3. 数据准备：jsonl → bin/idx
+
+Megatron 读取分词后的二进制索引格式，需先用官方 `preprocess_data.py` 转换：
+
+```bash
+# SFT 数据（input / output 分离，loss 只算回答部分）
+python scripts/megatron/prepare_sft_data.py \
+    --input data/train.jsonl --output-dir data/megatron \
+    --prefix countdown_sft --mode sft \
+    --tokenizer-path Qwen/Qwen2.5-3B-Instruct \
+    --megatron-path /path/to/Megatron-LM
+
+# 预训练语料（拼接为连续文本流）
+python scripts/megatron/prepare_sft_data.py \
+    --input data/train.jsonl --prefix countdown_pt --mode pretrain \
+    --megatron-path /path/to/Megatron-LM
+
+# 只生成中间 jsonl（离线环境稍后再处理）
+python scripts/megatron/prepare_sft_data.py --mode sft --skip-preprocess
+```
+
+- 产物：`data/megatron/<prefix>_<key>_document.bin/.idx`，
+  训练时用 `--data-path data/megatron/<prefix>` 引用（**不带后缀**）
+- `--megatron-path` 指向 Megatron-LM 源码根目录，也可 `export MEGATRON_PATH=/path/to/Megatron-LM`
+- 若未克隆源码：`git clone https://github.com/NVIDIA/Megatron-LM.git`
+
+### 4. 权重转换：HF ↔ Megatron-Core
+
+基于 [mbridge](https://github.com/ISEEKYAN/mbridge)（veRL 官方采用的 Megatron-Core 转换组件）：
+
+```bash
+# HF -> Megatron-Core（按 TP/PP 在线分片并保存）
+torchrun --nproc_per_node=8 scripts/megatron/convert_checkpoint.py \
+    --mode import --hf-path Qwen/Qwen2.5-3B-Instruct \
+    --save-path checkpoints/qwen2.5-3b-mcore --tp 2 --pp 1
+
+# Megatron-Core -> HF（训练后导出，供 vLLM / transformers 部署）
+torchrun --nproc_per_node=8 scripts/megatron/convert_checkpoint.py \
+    --mode export --hf-path Qwen/Qwen2.5-3B-Instruct \
+    --megatron-path checkpoints/qwen2.5-3b-mcore \
+    --save-path output/qwen2.5-3b-hf --tp 2 --pp 1 --memory-efficient
+```
+
+- 转换依赖 TransformerEngine（mbridge 官方注明 `use_te=False` 暂不支持）
+- 支持架构：Qwen2 / Qwen2.5-VL / Qwen3 / Qwen3-MoE / LLaMA / DeepseekV3 / Mixtral 等
+
+### 5. 预训练 / 继续预训练
+
+```bash
+# 自动检测 GPU 并按卡数推荐并行组合
+bash scripts/megatron/pretrain_qwen.sh \
+    --megatron-path /path/to/Megatron-LM \
+    --data-path data/megatron/countdown_pt
+
+# 显式指定并行度 + 从转换好的检查点继续预训练
+bash scripts/megatron/pretrain_qwen.sh \
+    --tp 2 --pp 1 --gbs 64 --mbs 4 --lr 3e-4 \
+    --load checkpoints/qwen2.5-3b-mcore
+```
+
+参数集中在 `configs/megatron/pretrain_qwen2.5-3b.env`（模型架构 / 并行 / 学习率 / 保存间隔），
+命令行参数优先级更高；加 `--dry-run` 可只打印组装后的完整命令而不执行。
+
+### 6. SFT 监督微调
+
+```bash
+bash scripts/megatron/sft_qwen.sh \
+    --megatron-path /path/to/Megatron-LM \
+    --data-path data/megatron/countdown_sft \
+    --load output/megatron/pretrain
+```
+
+与预训练的差异集中在 `configs/megatron/sft_qwen2.5-3b.env`：
+学习率降至 `1e-5`、warmup 占比 3%、关闭权重衰减、迭代步数更少。
+**务必用 `--load` 指定起始检查点**，否则会从随机初始化开始。
+
+### 7. GRPO 强化学习（veRL + Megatron 后端）
+
+```bash
+bash scripts/megatron/grpo_verl_megatron.sh \
+    --model-path output/megatron/sft \
+    --tp 2 --pp 1 --rollout-tp 1 \
+    --train-batch 64 --num-generations 8
+```
+
+要点：
+
+- 脚本会自动把 `data/*.jsonl` 转成 veRL 需要的 **parquet**（输出到 `data/megatron/verl/`），
+  其中 `prompt` 为 conversation 格式、`ground_truth` 为 target、`extra_info` 透传原始字段
+- Megatron 后端启用 **5D 并行 + 序列并行**，并通过 3D HybridEngine 在 actor(Megatron) 与
+  rollout(vLLM/SGLang) 之间做高效权重重分片
+- 显存紧张时加 `--offload`（参数 / 梯度 / 优化器卸载到 CPU）
+- **奖励函数**：项目 `scripts/reward_functions.py` 面向 TRL 接口，需按 veRL 签名再包一层，
+  然后用 `--custom-reward-module` / `--custom-reward-name` 指定（脚本头部注释含适配示例）
+- veRL 配置键随版本演进较快，报 `Could not resolve config` 时，
+  对照安装版本的 `verl/trainer/config/ppo_trainer.yaml` 调整本脚本参数即可
+
+### 8. 多机多卡（Megatron）
+
+```bash
+# 每个节点分别执行，仅 --node-rank 不同
+bash scripts/megatron/pretrain_qwen.sh \
+    --num-nodes 2 --node-rank 0 --master-addr <主节点IP> --master-port 29500 \
+    --gpus 8 --tp 2 --pp 2
+```
+
+- 可用 `--launcher deepspeed` 切换为 deepspeed 启动器（走其多机分发）
+- **跨机原则**：TP 限制在单节点内（NVLink 带宽高），跨机扩展优先用 PP / DP
+
+---
 
 ## QLoRA / ZeRO-3 / vLLM 注意事项
 
